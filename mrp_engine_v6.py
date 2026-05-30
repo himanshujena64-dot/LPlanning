@@ -629,10 +629,14 @@ def load_mb52_stock(mb52_bytes):
             df["__qty__"] += _to_num(df[qi_col])
         result = df.groupby(mat_col)["__qty__"].sum()
         result.index.name = "Component"
+        result.name = "Stock_Qty"
         return result
     except Exception as e:
         st.warning(f"MB52 load warning: {e}")
-        return pd.Series(dtype=float)
+        s = pd.Series(dtype=float)
+        s.index.name = "Component"
+        s.name = "Stock_Qty"
+        return s
 
 
 def load_prod_plan_xlsx(prod_bytes):
@@ -826,7 +830,13 @@ def run_mrp_engine(bom_bytes, mb52_bytes, prod_plan_bytes, receipt_bytes):
     mcols=[m for m in months if m in pivot.columns]
     if mcols: pivot[mcols]=pivot[mcols].cumsum(axis=1)
     bm=bom[["Component","Procurement type","Special procurement"]].drop_duplicates(subset="Component")
-    sd=stock.reset_index().rename(columns={"Stock_Qty":"Stock"})
+    sd = stock.reset_index()
+    # Column names: [Component, Stock_Qty] — rename value col to "Stock" regardless of its name
+    val_col = [c for c in sd.columns if c != "Component"]
+    if val_col:
+        sd = sd.rename(columns={val_col[0]: "Stock"})
+    else:
+        sd["Stock"] = 0
     pivot=pivot.merge(bm,on="Component",how="left").merge(sd,on="Component",how="left").merge(prod_summary,on="Component",how="left")
     for c,d in [("Procurement type",""),("Special procurement",""),("Stock",0),("Confirmed_Qty",0),("Open_Production_Qty",0)]:
         pivot[c]=pivot[c].fillna(d)
