@@ -301,7 +301,7 @@ for k, v in {
     "cfg_phantom": "50", "cfg_vl1": "0010748460",
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_mb52": None, "_prod_plan": None, "_prod": None, "_receipt": None,
-    "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None, "plan_open": False,
+    "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_pp": None, "_ag_rec": None, "plan_open": False,
     "authenticated": False, "_login_error": "",
 }.items():
     if k not in st.session_state:
@@ -670,7 +670,64 @@ def load_prod_plan_xlsx(prod_bytes):
 # ═══════════════════════════════════════════════════════════════
 # MRP ENGINE
 # ═══════════════════════════════════════════════════════════════
-def run_mrp_engine(bom_bytes, req_bytes, mb52_bytes, prod_plan_bytes, receipt_bytes):
+def parse_demand_from_prod_plan(prod_plan_bytes):
+    """
+    Convert Production Plan XLSX (Type | FG_Com | daily-date columns)
+    into the demand structure the MRP engine expects:
+      req  : DataFrame with columns [BOM Header, Alt, <Mon-YY>, ...]
+      months: list of month labels in chronological order
+    """
+    df = pd.read_excel(io.BytesIO(prod_plan_bytes))
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Identify FG_Com column (first column whose name contains fg/component/material,
+    # or second column as fallback)
+    fg_col = next(
+        (c for c in df.columns
+         if any(k in c.lower() for k in ("fg_com", "fg com", "fgcom", "component", "material"))),
+        df.columns[1] if len(df.columns) > 1 else df.columns[0]
+    )
+    skip_set = {c for c in df.columns
+                if c == fg_col or c.lower() in ("type", "alt", "alt.", "alternative")}
+    date_cols = [c for c in df.columns if c not in skip_set]
+
+    # Aggregate daily dates → month labels
+    month_agg = {}   # month_label → [col, ...]
+    for col in date_cols:
+        try:
+            ts = pd.Timestamp(col)
+            if pd.notna(ts) and ts.year > 2000:
+                lbl = ts.strftime("%d-%b-%y")          # keep same style as rest of engine
+                month_agg.setdefault(lbl, []).append(col)
+        except Exception:
+            pass
+
+    if not month_agg:
+        raise ValueError("No date columns found in Production Plan file.")
+
+    # Sort month labels chronologically
+    def _ts(lbl):
+        try: return pd.Timestamp(lbl)
+        except: return pd.Timestamp("2099-01-01")
+    months = sorted(month_agg.keys(), key=_ts)
+
+    df[fg_col] = df[fg_col].astype(str).str.strip()
+    df = df[df[fg_col].str.strip().astype(bool)].copy()
+    df = df[~df[fg_col].str.lower().isin(("nan", "none", ""))].copy()
+
+    # Sum daily cols per FG per month
+    for lbl, cols in month_agg.items():
+        df[lbl] = sum(pd.to_numeric(df[c], errors="coerce").fillna(0) for c in cols)
+
+    # Group by FG_Com
+    req = df.groupby(fg_col, as_index=False)[months].sum()
+    req = req.rename(columns={fg_col: "BOM Header"})
+    req["Alt"] = "0"
+
+    return req, months
+
+
+def run_mrp_engine(bom_bytes, mb52_bytes, prod_plan_bytes, receipt_bytes):
     logs=[]; log=lambda m: logs.append(m)
     status=st.status("Running MRP engine ...",expanded=True)
 
@@ -681,32 +738,23 @@ def run_mrp_engine(bom_bytes, req_bytes, mb52_bytes, prod_plan_bytes, receipt_by
     keep=["BOM Header","BOM header descripti","Alt","Level","Path","Parent","Component","Component descriptio","Required Qty","Base unit","Procurement type","Special procurement"]
     bom=bom[[c for c in keep if c in bom.columns]].copy()
 
-    with status: st.write("► Loading Requirement & Stock ...")
-    req_f=io.BytesIO(req_bytes)
-    hrrow=detect_req_header_row(req_f,sheet_name="Requirement"); req_f.seek(0)
-    req=pd.read_excel(req_f,sheet_name="Requirement",header=None)
-    req.columns=[standardize_req_header(x) for x in req.iloc[hrrow].tolist()]
-    req=req.iloc[hrrow+1:].reset_index(drop=True)
-    req=req.loc[:,[str(c).strip()!="" for c in req.columns]]
-    req=req.loc[:,~pd.Index(req.columns).duplicated(keep="first")]
-    if "BOM Header" not in req.columns: st.error("BOM Header column missing in Req file."); return None
-    req["BOM Header"]=req["BOM Header"].astype(str).str.strip()
-    req["Alt"]=pd.to_numeric(req.get("Alt",pd.Series(["0"]*len(req))),errors="coerce").fillna(0).astype(int).astype(str)
-    parsed=parse_all_month_cols(req.columns.tolist(),{"BOM Header","Alt"})
-    if not parsed: st.error("No month columns found."); return None
-    rename_map={p["orig"]:p["label"] for p in parsed if p["orig"]!=p["label"]}
-    if rename_map: req=req.rename(columns=rename_map)
-    months=[p["label"] for p in parsed]; MONTH_ORDER={m:i for i,m in enumerate(months)}
+    with status: st.write("► Loading demand from Production Plan ...")
+    try:
+        req, months = parse_demand_from_prod_plan(prod_plan_bytes)
+    except Exception as e:
+        st.error(f"Could not parse Production Plan: {e}"); return None
+    MONTH_ORDER = {m: i for i, m in enumerate(months)}
     for m in months:
-        col_data=safe_series(req,m)
-        req[m]=pd.to_numeric(col_data.astype(str).str.replace(",","",regex=False).str.strip(),errors="coerce").fillna(0)
-    # Load stock from MB52 TXT (sum Unrestricted + Quality Inspection, group by Material)
+        req[m] = pd.to_numeric(req[m].astype(str).str.replace(",","",regex=False).str.strip(),
+                               errors="coerce").fillna(0)
+    # Load stock from MB52 TXT
     stock = load_mb52_stock(mb52_bytes) if mb52_bytes else pd.Series(dtype=float)
-    receipt_qty=load_receipt_qty(io.BytesIO(receipt_bytes) if receipt_bytes else None)
+    receipt_qty = load_receipt_qty(io.BytesIO(receipt_bytes) if receipt_bytes else None)
     if not receipt_qty.empty:
-        for comp,qty in receipt_qty.items(): stock[comp]=float(stock.get(comp,0))+float(qty)
-    req_long=req.melt(id_vars=["BOM Header","Alt"],value_vars=months,var_name="Month",value_name="FG_Demand")
-    req_long=req_long[req_long["FG_Demand"]>0].copy()
+        for comp, qty in receipt_qty.items(): stock[comp] = float(stock.get(comp, 0)) + float(qty)
+    req_long = req.melt(id_vars=["BOM Header","Alt"], value_vars=months,
+                        var_name="Month", value_name="FG_Demand")
+    req_long = req_long[req_long["FG_Demand"] > 0].copy()
 
     with status: st.write("► Loading Production Plan ...")
     prod_summary = load_prod_plan_xlsx(prod_plan_bytes)
@@ -960,95 +1008,24 @@ def load_aging(f):
     return df.groupby("Material", as_index=False).agg(agg)
 
 
-def compute_bom_consumption(bom_bytes, req_bytes, phantom_code="50"):
+def compute_bom_consumption(bom_bytes, prod_plan_bytes, phantom_code="50"):
     """
     Standalone BOM explosion to get GROSS component requirement per month.
     Returns: dict  {material_code: {month_label: gross_qty}}
-    Uses the same alt-BOM-aware explosion as the main MRP engine,
-    but skips stock netting — pure gross consumption only.
+    Demand is sourced from the Production Plan XLSX (same file used by MRP engine).
     """
     import io, re
 
-    MONTH_ABBR_L = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-                    "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
-
-    def _parse_col(col, default_year=2026):
-        if isinstance(col, pd.Timestamp): return col.replace(day=1), col.strftime("%b-%y")
-        if hasattr(col, "year"):
-            ts = pd.Timestamp(col); return ts.replace(day=1), ts.strftime("%b-%y")
-        if pd.isna(col): return None, None
-        s = str(col).strip()
-        m = re.match(r'^([A-Za-z]{3})[-\'\s_](\d{2,4})$', s)
-        if m:
-            mon_s, yr_s = m.group(1).lower(), m.group(2)
-            mn = MONTH_ABBR_L.get(mon_s)
-            if mn:
-                yr = int(yr_s) + (2000 if len(yr_s) == 2 else 0)
-                return pd.Timestamp(year=yr, month=mn, day=1), s
-        try:
-            ts = pd.to_datetime(s, dayfirst=True, errors="raise")
-            return ts.replace(day=1), ts.strftime("%b-%y")
-        except:
-            return None, None
-
-    def _std(v):
-        if pd.isna(v): return ""
-        s = str(v).strip()
-        return {"alt.": "Alt", "alternative": "Alt", "bom header": "BOM Header"}.get(s.lower(), s)
-
-    def _detect_hrow(f_bytes, sheet="Requirement", scan=20):
-        raw = pd.read_excel(io.BytesIO(f_bytes), sheet_name=sheet, header=None, nrows=scan)
-        best_r, best_s = 0, -1
-        for i in range(len(raw)):
-            cleaned = [_std(x) for x in raw.iloc[i].tolist()]
-            score = (10 if "BOM Header" in cleaned else 0) + (5 if "Alt" in cleaned else 0) \
-                  + sum(1 for x in cleaned if _parse_col(x)[0] is not None)
-            if score > best_s: best_s, best_r = score, i
-        if best_s < 10:
-            raise ValueError("Could not detect header row in Requirement sheet.")
-        return best_r
-
     # ── BOM ──────────────────────────────────────────────────────
     bom = load_bom_from_bytes(bom_bytes)
-    # Ensure Component descriptio column exists (needed downstream)
     if "Component descriptio" not in bom.columns:
         bom["Component descriptio"] = ""
 
-    # ── Requirement ───────────────────────────────────────────────
-    hrrow = _detect_hrow(req_bytes)
-    req   = pd.read_excel(io.BytesIO(req_bytes), sheet_name="Requirement", header=None)
-    req.columns = [_std(x) for x in req.iloc[hrrow].tolist()]
-    req   = req.iloc[hrrow + 1:].reset_index(drop=True)
-    req   = req.loc[:, [str(c).strip() != "" for c in req.columns]]
-    req   = req.loc[:, ~pd.Index(req.columns).duplicated(keep="first")]
-    req["BOM Header"] = req["BOM Header"].astype(str).str.strip()
-    req["Alt"]        = pd.to_numeric(req.get("Alt", pd.Series(["0"] * len(req))),
-                                      errors="coerce").fillna(0).astype(int).astype(str)
-
-    # Parse month columns
-    skip = {"BOM Header", "Alt"}
-    cands = [c for c in req.columns if c not in skip]
-    parsed = []
-    for col in cands:
-        ts, lbl = _parse_col(col)
-        if ts is not None:
-            parsed.append({"orig": col, "ts": ts, "label": lbl})
-    parsed.sort(key=lambda x: x["ts"])
-    # deduplicate
-    seen, unique = [], []
-    for p in parsed:
-        if p["ts"] not in seen: seen.append(p["ts"]); unique.append(p)
-    parsed = unique
-
-    rename_map = {p["orig"]: p["label"] for p in parsed if p["orig"] != p["label"]}
-    if rename_map: req = req.rename(columns=rename_map)
-    months = [p["label"] for p in parsed]
+    # ── Demand from Production Plan ───────────────────────────────
+    req, months = parse_demand_from_prod_plan(prod_plan_bytes)
     MONTH_ORDER = {m: i for i, m in enumerate(months)}
-
     for m in months:
-        col_data = req[m]
-        if isinstance(col_data, pd.DataFrame): col_data = col_data.iloc[:, 0]
-        req[m] = pd.to_numeric(col_data.astype(str).str.replace(",", "", regex=False).str.strip(),
+        req[m] = pd.to_numeric(req[m].astype(str).str.replace(",","",regex=False).str.strip(),
                                errors="coerce").fillna(0)
 
     req_long = req.melt(id_vars=["BOM Header", "Alt"], value_vars=months,
@@ -1547,17 +1524,17 @@ elif st.session_state["page"] == "upload":
                 unsafe_allow_html=True)
 
     # Status badges
-    _bom_ok  = bool(st.session_state.get("_bom"))
-    _req_ok  = bool(st.session_state.get("_req"))
-    _mb52_ok = bool(st.session_state.get("_mb52"))
+    _bom_ok      = bool(st.session_state.get("_bom"))
+    _mb52_ok     = bool(st.session_state.get("_mb52"))
+    _prod_plan_ok = bool(st.session_state.get("_prod_plan"))
     status_html = ""
-    if _bom_ok:  status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● BOM done</span>'
-    if _req_ok:  status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● Requirement done</span>'
-    if _mb52_ok: status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● MB52 Stock done</span>'
+    if _bom_ok:       status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● BOM done</span>'
+    if _mb52_ok:      status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● MB52 Stock done</span>'
+    if _prod_plan_ok: status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● Production Plan done</span>'
     if status_html:
         st.markdown(f'<div style="margin-bottom:12px;">{status_html}</div>', unsafe_allow_html=True)
 
-    # ── Row 1: BOM + Requirement ───────────────────────────────
+    # ── Row 1: BOM + MB52 Stock ────────────────────────────────
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
@@ -1570,40 +1547,27 @@ elif st.session_state["page"] == "upload":
 
     with c2:
         st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
-        <div class="ucard-icon green">📊</div><div><p class="ucard-title">Requirement File</p>
-        <p class="ucard-desc">XLSX with Requirement sheet (BOM Header + month columns)</p></div></div>
-        <span class="badge-req">Required</span></div></div>""", unsafe_allow_html=True)
-        rf = st.file_uploader("Req", type=["xlsx","xls"], key="req_u", label_visibility="collapsed")
-        if rf: st.session_state["_req"] = rf.read()
-        _file_status("_req", "Requirement file")
-
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-    # ── Row 2: MB52 Stock + Production Plan ───────────────────
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
         <div class="ucard-icon orange">🗄️</div><div><p class="ucard-title">MB52 Stock File</p>
-        <p class="ucard-desc">SAP MB52 TXT export — Unrestricted + Quality Inspection summed by material</p></div></div>
+        <p class="ucard-desc">SAP MB52 TXT export — Unrestricted + Quality Inspection summed</p></div></div>
         <span class="badge-req">Required</span></div></div>""", unsafe_allow_html=True)
         mf = st.file_uploader("MB52", type=["txt","TXT"], key="mb52_u", label_visibility="collapsed")
         if mf: st.session_state["_mb52"] = mf.read()
         _file_status("_mb52", "MB52 Stock file", "Accepted: .TXT (SAP MB52 export)")
 
-    with c4:
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+    # ── Row 2: Production Plan (Required) + Receipt (Optional) ─
+    c3, c4 = st.columns(2)
+    with c3:
         st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
         <div class="ucard-icon blue">📦</div><div><p class="ucard-title">Production Plan</p>
-        <p class="ucard-desc">XLSX with Type | FG_Com | daily date columns</p></div></div>
-        <span class="badge-opt">Optional</span></div></div>""", unsafe_allow_html=True)
+        <p class="ucard-desc">XLSX with Type | FG_Com | daily date columns — source of FG demand</p></div></div>
+        <span class="badge-req">Required</span></div></div>""", unsafe_allow_html=True)
         pf = st.file_uploader("ProdPlan", type=["xlsx","xls"], key="prod_plan_u", label_visibility="collapsed")
         if pf: st.session_state["_prod_plan"] = pf.read()
         _file_status("_prod_plan", "Production Plan file")
 
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-    # ── Row 3: Receipt Quantities ─────────────────────────────
-    c5, _ = st.columns(2)
-    with c5:
+    with c4:
         st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
         <div class="ucard-icon purple">📥</div><div><p class="ucard-title">Receipt Quantities</p>
         <p class="ucard-desc">Month-wise receipt file (Component + month columns)</p></div></div>
@@ -1613,8 +1577,8 @@ elif st.session_state["page"] == "upload":
         _file_status("_receipt", "Receipt Quantities file")
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    ready = _bom_ok and _req_ok and _mb52_ok
-    bar_sub = "All required files loaded · Click Run MRP to proceed" if ready else "Upload BOM, Requirement and MB52 Stock files to continue"
+    ready = _bom_ok and _mb52_ok and _prod_plan_ok
+    bar_sub = "All required files loaded · Click Run MRP to proceed" if ready else "Upload BOM, MB52 Stock and Production Plan files to continue"
     st.markdown(f'''<div class="run-bar">
       <div><div class="run-bar-text">{"Ready to process! ✓" if ready else "Waiting for required files..."}</div>
       <div class="run-bar-sub">{bar_sub}</div></div>
@@ -1632,12 +1596,11 @@ elif st.session_state["page"] == "mrp":
     topbar("Run MRP", "Execute Material Requirements Planning — L1 to L4 BOM explosion")
 
     bom_b     = st.session_state.get("_bom")
-    req_b     = st.session_state.get("_req")
     mb52_b    = st.session_state.get("_mb52")
     prod_pl_b = st.session_state.get("_prod_plan")
     receipt_b = st.session_state.get("_receipt")
 
-    if not bom_b or not req_b or not mb52_b:
+    if not bom_b or not mb52_b or not prod_pl_b:
         sec("File Input")
         st.info("Upload files on the **Upload Files** page, or upload directly below.")
         a, b2 = st.columns(2)
@@ -1645,17 +1608,13 @@ elif st.session_state["page"] == "mrp":
             f=st.file_uploader("BOM File * (.txt/.xlsx)",type=["txt","xlsx","xls"],key="bom_m")
             if f: bom_b=f.read(); st.session_state["_bom"]=bom_b
         with b2:
-            f=st.file_uploader("Requirement File * (.xlsx)",type=["xlsx","xls"],key="req_m")
-            if f: req_b=f.read(); st.session_state["_req"]=req_b
-        c, d = st.columns(2)
-        with c:
             f=st.file_uploader("MB52 Stock File * (.txt)",type=["txt","TXT"],key="mb52_m")
             if f: mb52_b=f.read(); st.session_state["_mb52"]=mb52_b
-        with d:
-            f=st.file_uploader("Production Plan (.xlsx)",type=["xlsx","xls"],key="prod_plan_m")
+        c, d = st.columns(2)
+        with c:
+            f=st.file_uploader("Production Plan * (.xlsx)",type=["xlsx","xls"],key="prod_plan_m")
             if f: prod_pl_b=f.read(); st.session_state["_prod_plan"]=prod_pl_b
-        _, e = st.columns(2)
-        with _:
+        with d:
             f=st.file_uploader("Receipt Quantities (.xlsx)",type=["xlsx","xls"],key="rec_m")
             if f: receipt_b=f.read(); st.session_state["_receipt"]=receipt_b
 
@@ -1663,11 +1622,11 @@ elif st.session_state["page"] == "mrp":
     with rb:
         run_btn=st.button("▶ Execute MRP",type="primary",use_container_width=True,key="exec_mrp")
     if run_btn:
-        if not bom_b or not req_b or not mb52_b:
-            st.warning("Upload BOM, Requirement and MB52 Stock files first.")
+        if not bom_b or not mb52_b or not prod_pl_b:
+            st.warning("Upload BOM, MB52 Stock and Production Plan files first.")
         else:
             try:
-                results=run_mrp_engine(bom_b, req_b, mb52_b, prod_pl_b, receipt_b)
+                results=run_mrp_engine(bom_b, mb52_b, prod_pl_b, receipt_b)
                 if results: st.session_state["mrp_results"]=results; st.success("MRP completed.")
             except Exception as e: st.exception(e)
 
@@ -1913,9 +1872,9 @@ elif st.session_state["page"] == "aging":
 
     sec("Input Files")
 
-    # ── BOM and Req auto-carry from MRP session — no re-upload needed ──
-    _bom_ready = bool(st.session_state.get("_bom"))
-    _req_ready = bool(st.session_state.get("_req"))
+    # ── BOM and Prod Plan auto-carry from MRP session — no re-upload needed ──
+    _bom_ready      = bool(st.session_state.get("_bom"))
+    _prod_plan_ready = bool(st.session_state.get("_prod_plan"))
 
     fc1, fc2 = st.columns(2)
     with fc1:
@@ -1930,35 +1889,35 @@ elif st.session_state["page"] == "aging":
         if rec_ag_f:
             st.session_state["_ag_rec"] = rec_ag_f.read()
 
-    # Show BOM / Req status — auto-used from MRP session, override only if needed
+    # Show BOM / Prod Plan status — auto-used from MRP session
     fc3, fc4 = st.columns(2)
     with fc3:
         if _bom_ready:
             st.success("✓ BOM file — carried from MRP session (no re-upload needed)")
             bom_override = st.file_uploader("Upload different BOM (optional override)",
-                                            type=["xlsx","xls"], key="ag_bom_f")
+                                            type=["txt","xlsx","xls"], key="ag_bom_f")
             if bom_override:
                 st.session_state["_ag_bom"] = bom_override.read()
                 st.caption("Using overridden BOM for aging")
         else:
-            bom_ag_f = st.file_uploader("BOM File (.xlsx) *Required*",
-                                        type=["xlsx","xls"], key="ag_bom_f")
+            bom_ag_f = st.file_uploader("BOM File (.txt/.xlsx) *Required*",
+                                        type=["txt","xlsx","xls"], key="ag_bom_f")
             if bom_ag_f:
                 st.session_state["_ag_bom"] = bom_ag_f.read()
 
     with fc4:
-        if _req_ready:
-            st.success("✓ Requirement file — carried from MRP session (no re-upload needed)")
-            req_override = st.file_uploader("Upload different Requirement (optional override)",
-                                            type=["xlsx","xls"], key="ag_req_f")
-            if req_override:
-                st.session_state["_ag_req"] = req_override.read()
-                st.caption("Using overridden Requirement for aging")
+        if _prod_plan_ready:
+            st.success("✓ Production Plan — carried from MRP session (no re-upload needed)")
+            pp_override = st.file_uploader("Upload different Production Plan (optional override)",
+                                           type=["xlsx","xls"], key="ag_pp_f")
+            if pp_override:
+                st.session_state["_ag_pp"] = pp_override.read()
+                st.caption("Using overridden Production Plan for aging")
         else:
-            req_ag_f = st.file_uploader("Requirement File (.xlsx) *Required*",
-                                        type=["xlsx","xls"], key="ag_req_f")
-            if req_ag_f:
-                st.session_state["_ag_req"] = req_ag_f.read()
+            pp_ag_f = st.file_uploader("Production Plan (.xlsx) *Required*",
+                                       type=["xlsx","xls"], key="ag_pp_f")
+            if pp_ag_f:
+                st.session_state["_ag_pp"] = pp_ag_f.read()
 
     fc5, _ = st.columns([1, 3])
     with fc5:
@@ -1973,15 +1932,15 @@ elif st.session_state["page"] == "aging":
                            use_container_width=True, key="run_ag")
 
     if run_ag:
-        ag_bytes  = st.session_state.get("_aging")
-        bom_bytes = st.session_state.get("_ag_bom") or st.session_state.get("_bom")
-        req_bytes = st.session_state.get("_ag_req") or st.session_state.get("_req")
-        rec_bytes = st.session_state.get("_ag_rec")
+        ag_bytes        = st.session_state.get("_aging")
+        bom_bytes       = st.session_state.get("_ag_bom") or st.session_state.get("_bom")
+        prod_plan_bytes = st.session_state.get("_ag_pp") or st.session_state.get("_prod_plan")
+        rec_bytes       = st.session_state.get("_ag_rec")
 
         missing = []
-        if not ag_bytes:  missing.append("Aging Material Details")
-        if not bom_bytes: missing.append("BOM File")
-        if not req_bytes: missing.append("Requirement File")
+        if not ag_bytes:        missing.append("Aging Material Details")
+        if not bom_bytes:       missing.append("BOM File")
+        if not prod_plan_bytes: missing.append("Production Plan")
         if missing:
             st.warning(f"Please upload: {', '.join(missing)}")
         else:
@@ -1996,10 +1955,10 @@ elif st.session_state["page"] == "aging":
                                            "181-360 Qty","Over361 Qty"]].sum(axis=1) > 0).sum())
                     st.write(f"   → {n_mats:,} unique materials · {n_aging90:,} with current 90+ day aging")
 
-                    # Step 2 — BOM explosion
+                    # Step 2 — BOM explosion using Prod Plan as demand source
                     st.write("► Step 2 — Exploding BOM (L1–L4) to get gross component consumption ...")
                     prod_cons, months_from_req = compute_bom_consumption(
-                        bom_bytes, req_bytes,
+                        bom_bytes, prod_plan_bytes,
                         phantom_code=str(st.session_state.get("cfg_phantom","50")).strip())
                     st.write(f"   → {len(prod_cons):,} components with BOM consumption · "
                              f"{len(months_from_req)} months: {', '.join(months_from_req)}")
@@ -2427,6 +2386,6 @@ elif st.session_state["page"] == "settings":
     st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
     if st.button("🗑 Clear all session data",key="clr"):
         for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes",
-                  "_bom","_req","_mb52","_prod_plan","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_rec"]:
+                  "_bom","_req","_mb52","_prod_plan","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_pp","_ag_rec"]:
             st.session_state[k]=None
         st.success("Session cleared."); st.rerun()
